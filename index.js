@@ -134,10 +134,14 @@ function validateAndResolvePath(userPath) {
 
 // ---- ip safety ----
 function isPrivateOrReservedIp(ip) {
+  if (!ip) return true;
   const ver = net.isIP(ip);
+  if (ver === 0) return true;
+
   if (ver === 4) {
     const parts = ip.split('.').map(Number);
-    const [a, b, c] = parts;
+    if (parts.length !== 4 || parts.some(isNaN)) return true;
+    const [a, b, c, d] = parts;
     if (a === 0 || a === 10 || a === 127 || a >= 224) return true;
     if (a === 169 && b === 254) return true;
     if (a === 172 && b >= 16 && b <= 31) return true;
@@ -148,20 +152,45 @@ function isPrivateOrReservedIp(ip) {
     if (a === 203 && b === 0 && c === 113) return true;
     return false;
   }
+
   if (ver === 6) {
     const low = ip.toLowerCase();
     if (low === '::' || low === '::1') return true;
-    if (low.startsWith('::ffff:')) {
-      const v4 = low.split(':').pop();
-      if (net.isIP(v4) === 4) return isPrivateOrReservedIp(v4);
+
+    // Check for embedded IPv4 in dot notation (e.g. ::ffff:127.0.0.1 or 0:0:0:0:0:ffff:127.0.0.1)
+    const lastPart = low.split(':').pop();
+    if (net.isIP(lastPart) === 4) {
+      return isPrivateOrReservedIp(lastPart);
     }
+
+    // Check for IPv4-mapped IPv6 in hex notation (e.g. ::ffff:7f00:1 or ::ffff:a9fe:a9fe)
+    if (low.includes('ffff:')) {
+      const hexParts = low.split('ffff:')[1];
+      if (hexParts && hexParts.includes(':')) {
+        const [h1, h2] = hexParts.split(':').map(x => parseInt(x, 16));
+        if (!isNaN(h1) && !isNaN(h2)) {
+          const a = (h1 >> 8) & 0xff;
+          const b = h1 & 0xff;
+          const c = (h2 >> 8) & 0xff;
+          const d = h2 & 0xff;
+          const mappedV4 = `${a}.${b}.${c}.${d}`;
+          return isPrivateOrReservedIp(mappedV4);
+        }
+      }
+    }
+
+    // Check IPv6 private/link-local/multicast prefixes
     const firstBlock = low.split(':')[0];
     if (firstBlock.startsWith('fc') || firstBlock.startsWith('fd')) return true;
     if (/^fe[89ab]/i.test(firstBlock)) return true;
     if (firstBlock.startsWith('ff')) return true;
+    if (low.startsWith('2001:db8')) return true;
+    if (low.startsWith('::')) return true;
+
     return false;
   }
-  return false;
+
+  return true;
 }
 
 // ---- URL structure & host validation ----
