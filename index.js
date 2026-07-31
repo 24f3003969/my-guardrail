@@ -46,22 +46,37 @@ function isPrivateOrReservedIp(ip) {
   const ver = net.isIP(ip);
   if (ver === 4) {
     const [a, b, c] = ip.split('.').map(Number);
-    if (a === 10) return true;
-    if (a === 127) return true;
-    if (a === 169 && b === 254) return true;
-    if (a === 172 && b >= 16 && b <= 31) return true;
-    if (a === 192 && b === 168) return true;
-    if (a === 0) return true;
-    if (a === 100 && b >= 64 && b <= 127) return true;
-    if (a === 192 && b === 0 && c === 2) return true;
-    if (a >= 224) return true;
+    if (a === 0) return true; // Current network
+    if (a === 10) return true; // Private
+    if (a === 127) return true; // Loopback
+    if (a === 169 && b === 254) return true; // Link-local
+    if (a === 172 && b >= 16 && b <= 31) return true; // Private
+    if (a === 192 && b === 168) return true; // Private
+    if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT
+    if (a === 192 && b === 0 && c === 0) return true; // IETF Protocol
+    if (a === 192 && b === 0 && c === 2) return true; // TEST-NET-1
+    if (a === 198 && b >= 18 && b <= 19) return true; // Benchmark
+    if (a === 198 && b === 51 && c === 100) return true; // TEST-NET-2
+    if (a === 203 && b === 0 && c === 113) return true; // TEST-NET-3
+    if (a >= 224) return true; // Multicast & Reserved
     return false;
   }
   if (ver === 6) {
     const low = ip.toLowerCase();
-    if (low === '::1') return true;
-    if (low.startsWith('fe80:')) return true;
-    if (low.startsWith('fc') || low.startsWith('fd')) return true;
+    
+    // Unspecified (::) and Loopback (::1)
+    if (low === '::' || low === '::1') return true;
+    
+    // Link-local (fe80::/10) - matches fe8, fe9, fea, feb
+    if (/^fe[89ab][0-9a-f]:/i.test(low)) return true;
+    
+    // Unique local (fc00::/7) - matches fc, fd
+    if (/^f[cd][0-9a-f]{2}:/i.test(low)) return true;
+    
+    // Multicast (ff00::/8)
+    if (low.startsWith('ff')) return true;
+
+    // IPv4-mapped (::ffff:0:0/96)
     if (low.startsWith('::ffff:')) {
       const v4 = low.split(':').pop();
       if (net.isIP(v4) === 4) return isPrivateOrReservedIp(v4);
@@ -73,17 +88,56 @@ function isPrivateOrReservedIp(ip) {
 
 // ---- hostname / scheme / userinfo checks only (no DNS here) ----
 function isUrlStructurallyAllowed(rawUrl) {
+  if (typeof rawUrl !== 'string') return { ok: false, reason: 'not a string' };
+  
+  // Trim spaces and prevent control characters
+  rawUrl = rawUrl.trim();
+  if (/[\x00-\x20\x7F]/.test(rawUrl)) {
+    return { ok: false, reason: 'invalid characters' };
+  }
+
+  // Extract authority explicitly to avoid Node URL parsing bypasses
+  const match = rawUrl.match(/^https?:\/\/([^\/?#]+)/i);
+  if (!match) return { ok: false, reason: 'invalid scheme or format' };
+  
+  const authority = match[1];
+
+  // Defend against userinfo and backslash parsing tricks (Orange Tsai SSRF vectors)
+  if (authority.includes('@') || authority.includes('\\')) {
+    return { ok: false, reason: 'userinfo confused' };
+  }
+
+  // Extract raw host (ignoring port and ipv6 brackets if they existed)
+  let rawHost = authority;
+  if (rawHost.includes(':')) {
+    rawHost = rawHost.substring(0, rawHost.lastIndexOf(':'));
+  }
+  if (rawHost.startsWith('[') && rawHost.endsWith(']')) {
+    rawHost = rawHost.substring(1, rawHost.length - 1);
+  }
+  
+  // Verify against allowlist directly using the raw, un-normalized string to catch lookalikes
+  const normalizedRawHost = rawHost.toLowerCase().replace(/\.+$/, '');
+  if (!ALLOWED_HOSTS.has(normalizedRawHost)) {
+    return { ok: false, reason: 'host not in allowlist' };
+  }
+
+  // Now use Node's URL to parse it to ensure it's structurally valid for the HTTP client
   let u;
   try { u = new URL(rawUrl); } catch { return { ok: false, reason: 'invalid URL' }; }
+  
   if (u.protocol !== 'http:' && u.protocol !== 'https:')
     return { ok: false, reason: 'unsupported scheme' };
   if (u.username || u.password)
     return { ok: false, reason: 'userinfo not allowed' };
+
   const hostname = u.hostname.toLowerCase().replace(/\.+$/, '');
   if (!ALLOWED_HOSTS.has(hostname))
     return { ok: false, reason: 'host not in allowlist' };
+    
   if (net.isIP(hostname) && isPrivateOrReservedIp(hostname))
     return { ok: false, reason: 'private ip literal' };
+    
   return { ok: true, url: u, hostname };
 }
 
