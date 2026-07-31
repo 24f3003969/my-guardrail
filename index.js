@@ -69,28 +69,39 @@ function validateAndResolvePath(userPath) {
   const rootWithSep = SANDBOX_ROOT.endsWith('/') ? SANDBOX_ROOT : SANDBOX_ROOT + '/';
 
   for (const cand of candidates) {
-    // Check segment-level traversal
-    const parts = cand.split('/');
-    if (parts.includes('..')) {
-      const resolvedCand = path.resolve(SANDBOX_ROOT, cand);
-      if (resolvedCand !== SANDBOX_ROOT && !resolvedCand.startsWith(rootWithSep)) {
-        return { ok: false, reason: 'path traversal detected (..)' };
-      }
+    // 1. Resolve path as absolute if it starts with '/' or drive letter, or relative to SANDBOX_ROOT
+    let resolvedCand;
+    if (cand.startsWith('/') || cand.startsWith('\\') || /^[a-zA-Z]:/.test(cand)) {
+      resolvedCand = path.resolve(cand);
+    } else {
+      resolvedCand = path.resolve(SANDBOX_ROOT, cand);
     }
 
-    const resolvedCand = path.resolve(SANDBOX_ROOT, cand);
     if (resolvedCand !== SANDBOX_ROOT && !resolvedCand.startsWith(rootWithSep)) {
       return { ok: false, reason: 'path resolves outside sandbox' };
+    }
+
+    // 2. Also check if forcing candidate to be relative to SANDBOX_ROOT escapes SANDBOX_ROOT
+    const relResolved = path.resolve(SANDBOX_ROOT, cand.replace(/^[/\\]+/, ''));
+    if (relResolved !== SANDBOX_ROOT && !relResolved.startsWith(rootWithSep)) {
+      return { ok: false, reason: 'relative path resolves outside sandbox' };
     }
   }
 
   // Determine target path on disk
-  let targetPath = path.resolve(SANDBOX_ROOT, normRaw);
+  let targetPath;
+  if (normRaw.startsWith('/') || normRaw.startsWith('\\')) {
+    targetPath = path.resolve(normRaw);
+  } else {
+    targetPath = path.resolve(SANDBOX_ROOT, normRaw);
+  }
+
   if (!fs.existsSync(targetPath)) {
     try {
-      const decodedPath = path.resolve(SANDBOX_ROOT, decodeURIComponent(normRaw));
-      if (fs.existsSync(decodedPath)) {
-        targetPath = decodedPath;
+      const decoded = decodeURIComponent(normRaw);
+      const decodedTarget = decoded.startsWith('/') ? path.resolve(decoded) : path.resolve(SANDBOX_ROOT, decoded);
+      if (fs.existsSync(decodedTarget)) {
+        targetPath = decodedTarget;
       }
     } catch {}
   }
@@ -208,13 +219,21 @@ function validateUrlStructure(rawUrl) {
   return { ok: true, url: u, hostname };
 }
 
+function withTimeout(promise, ms, message) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 async function isUrlAllowed(rawUrl) {
   const struct = validateUrlStructure(rawUrl);
   if (!struct.ok) return struct;
 
   let records;
   try {
-    records = await dns.lookup(struct.hostname, { all: true });
+    records = await withTimeout(dns.lookup(struct.hostname, { all: true }), 1500, 'dns lookup timed out');
   } catch {
     return { ok: false, reason: 'dns lookup failed' };
   }
@@ -256,7 +275,7 @@ function requestPinned(u, ip) {
           cb(null, ip, net.isIP(ip) || 4);
         }
       },
-      timeout: 5000
+      timeout: 2500
     };
 
     const req = mod.request(opts, (res) => {
@@ -290,18 +309,35 @@ async function safeFetch(rawUrl, hops = 0) {
 
 async function handle(req, res) {
   const { tool, arguments: args } = req.body || {};
+
+  let responded = false;
+  const timeoutTimer = setTimeout(() => {
+    if (!responded) {
+      responded = true;
+      res.json({ action: 'block', reason: 'request processing timeout' });
+    }
+  }, 3500);
+
+  function reply(payload) {
+    if (!responded) {
+      responded = true;
+      clearTimeout(timeoutTimer);
+      res.json(payload);
+    }
+  }
+
   try {
     if (tool === 'read_file') {
       const pathArg = args && args.path;
       const pathCheck = validateAndResolvePath(pathArg);
       if (!pathCheck.ok) {
-        return res.json({ action: 'block', reason: pathCheck.reason });
+        return reply({ action: 'block', reason: pathCheck.reason });
       }
       try {
         const content = fs.readFileSync(pathCheck.safePath, 'utf8');
-        return res.json({ action: 'allow', reason: 'within sandbox', result: content });
+        return reply({ action: 'allow', reason: 'within sandbox', result: content });
       } catch (e) {
-        return res.json({ action: 'block', reason: 'failed to read file' });
+        return reply({ action: 'block', reason: 'failed to read file' });
       }
     }
 
@@ -309,20 +345,20 @@ async function handle(req, res) {
       const rawUrl = args && args.url;
       const check = await isUrlAllowed(rawUrl);
       if (!check.ok) {
-        return res.json({ action: 'block', reason: check.reason });
+        return reply({ action: 'block', reason: check.reason });
       }
 
       try {
         const content = await safeFetch(rawUrl);
-        return res.json({ action: 'allow', reason: 'host allowlisted', result: content });
+        return reply({ action: 'allow', reason: 'host allowlisted', result: content });
       } catch (e) {
-        return res.json({ action: 'block', reason: e.message || 'fetch failed' });
+        return reply({ action: 'block', reason: e.message || 'fetch failed' });
       }
     }
 
-    return res.json({ action: 'block', reason: 'unknown tool' });
+    return reply({ action: 'block', reason: 'unknown tool' });
   } catch (e) {
-    return res.json({ action: 'block', reason: 'internal error' });
+    return reply({ action: 'block', reason: 'internal error' });
   }
 }
 
