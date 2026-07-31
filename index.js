@@ -35,9 +35,25 @@ ensureFile(path.join(SANDBOX_ROOT, 'encoded/%2e%2e-literal.txt'),
 function resolveSafePath(userPath) {
   if (typeof userPath !== 'string' || userPath.length === 0) return null;
   if (userPath.includes('\0')) return null;
+
   const resolved = path.resolve(SANDBOX_ROOT, userPath);
   const rootWithSep = SANDBOX_ROOT.endsWith(path.sep) ? SANDBOX_ROOT : SANDBOX_ROOT + path.sep;
-  if (resolved === SANDBOX_ROOT || resolved.startsWith(rootWithSep)) return resolved;
+
+  if (resolved === SANDBOX_ROOT || resolved.startsWith(rootWithSep)) {
+    try {
+      // Prevent symlink traversal by resolving the real canonical path
+      if (fs.existsSync(resolved)) {
+        const real = fs.realpathSync(resolved);
+        if (real !== SANDBOX_ROOT && !real.startsWith(rootWithSep)) {
+          return null; 
+        }
+        return real;
+      }
+      return resolved;
+    } catch {
+      return null;
+    }
+  }
   return null;
 }
 
@@ -46,41 +62,30 @@ function isPrivateOrReservedIp(ip) {
   const ver = net.isIP(ip);
   if (ver === 4) {
     const [a, b, c] = ip.split('.').map(Number);
-    if (a === 0) return true; // Current network
-    if (a === 10) return true; // Private
-    if (a === 127) return true; // Loopback
-    if (a === 169 && b === 254) return true; // Link-local
-    if (a === 172 && b >= 16 && b <= 31) return true; // Private
-    if (a === 192 && b === 168) return true; // Private
-    if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT
-    if (a === 192 && b === 0 && c === 0) return true; // IETF Protocol
-    if (a === 192 && b === 0 && c === 2) return true; // TEST-NET-1
-    if (a === 198 && b >= 18 && b <= 19) return true; // Benchmark
-    if (a === 198 && b === 51 && c === 100) return true; // TEST-NET-2
-    if (a === 203 && b === 0 && c === 113) return true; // TEST-NET-3
-    if (a >= 224) return true; // Multicast & Reserved
+    if (a === 0 || a === 10 || a === 127 || a >= 224) return true;
+    if (a === 169 && b === 254) return true; 
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 192 && b === 168) return true; 
+    if (a === 100 && b >= 64 && b <= 127) return true; 
+    if (a === 192 && b === 0 && (c === 0 || c === 2)) return true;
+    if (a === 198 && ((b >= 18 && b <= 19) || (b === 51 && c === 100))) return true;
+    if (a === 203 && b === 0 && c === 113) return true; 
     return false;
   }
   if (ver === 6) {
     const low = ip.toLowerCase();
-    
-    // Unspecified (::) and Loopback (::1)
     if (low === '::' || low === '::1') return true;
-    
-    // Link-local (fe80::/10) - matches fe8, fe9, fea, feb
-    if (/^fe[89ab][0-9a-f]:/i.test(low)) return true;
-    
-    // Unique local (fc00::/7) - matches fc, fd
-    if (/^f[cd][0-9a-f]{2}:/i.test(low)) return true;
-    
-    // Multicast (ff00::/8)
-    if (low.startsWith('ff')) return true;
-
-    // IPv4-mapped (::ffff:0:0/96)
     if (low.startsWith('::ffff:')) {
       const v4 = low.split(':').pop();
       if (net.isIP(v4) === 4) return isPrivateOrReservedIp(v4);
     }
+    
+    // Isolate the first block for robust prefix evaluation
+    const firstBlock = low.split(':')[0];
+    if (firstBlock.startsWith('fc') || firstBlock.startsWith('fd')) return true;
+    if (/^fe[89ab]/i.test(firstBlock)) return true;
+    if (firstBlock.startsWith('ff')) return true;
+    
     return false;
   }
   return false;
@@ -184,7 +189,7 @@ function requestPinned(u, ip) {
       path: u.pathname + u.search,
       headers: { Host: u.hostname, 'User-Agent': 'guardrail/1.0' },
       servername: u.protocol === 'https:' ? u.hostname : undefined,
-      timeout: 8000,
+      timeout: 3000,
     };
     const req = mod.request(opts, (res) => {
       let data = '';
