@@ -3,6 +3,8 @@ const fs = require('fs');
 const path = require('path');
 const dns = require('dns').promises;
 const net = require('net');
+const http = require('http');
+const https = require('https');
 
 const app = express();
 app.use(express.json());
@@ -69,40 +71,87 @@ function isPrivateOrReservedIp(ip) {
   return false;
 }
 
-async function isUrlAllowed(rawUrl) {
+// ---- hostname / scheme / userinfo checks only (no DNS here) ----
+function isUrlStructurallyAllowed(rawUrl) {
   let u;
   try { u = new URL(rawUrl); } catch { return { ok: false, reason: 'invalid URL' }; }
   if (u.protocol !== 'http:' && u.protocol !== 'https:')
     return { ok: false, reason: 'unsupported scheme' };
   if (u.username || u.password)
     return { ok: false, reason: 'userinfo not allowed' };
-  const hostname = u.hostname.toLowerCase().replace(/\.$/, '');
+  const hostname = u.hostname.toLowerCase().replace(/\.+$/, '');
   if (!ALLOWED_HOSTS.has(hostname))
     return { ok: false, reason: 'host not in allowlist' };
   if (net.isIP(hostname) && isPrivateOrReservedIp(hostname))
     return { ok: false, reason: 'private ip literal' };
+  return { ok: true, url: u, hostname };
+}
+
+// resolves DNS and validates every record; returns a single safe IP to connect to
+async function resolveHostSafe(hostname) {
+  let records;
   try {
-    const records = await dns.lookup(hostname, { all: true });
-    for (const r of records) {
-      if (isPrivateOrReservedIp(r.address))
-        return { ok: false, reason: 'dns resolves to private ip' };
-    }
-  } catch { return { ok: false, reason: 'dns lookup failed' }; }
-  return { ok: true, url: u };
+    records = await dns.lookup(hostname, { all: true });
+  } catch {
+    throw new Error('dns lookup failed');
+  }
+  if (!records || records.length === 0) throw new Error('no dns records');
+  for (const r of records) {
+    if (isPrivateOrReservedIp(r.address)) throw new Error('dns resolves to private ip');
+  }
+  const v4 = records.find((r) => r.family === 4);
+  return (v4 || records[0]).address;
+}
+
+// combined check used before we actually connect (also used for the initial block/allow decision)
+async function isUrlAllowed(rawUrl) {
+  const structural = isUrlStructurallyAllowed(rawUrl);
+  if (!structural.ok) return structural;
+  try {
+    await resolveHostSafe(structural.hostname);
+  } catch (e) {
+    return { ok: false, reason: e.message || 'dns validation failed' };
+  }
+  return structural;
+}
+
+// makes the actual HTTP(S) request to a pinned IP so the connection target
+// is guaranteed to be the exact address we validated (no second DNS lookup
+// happens inside the HTTP client, closing the TOCTOU/rebinding gap).
+function requestPinned(u, ip) {
+  return new Promise((resolve, reject) => {
+    const mod = u.protocol === 'https:' ? https : http;
+    const opts = {
+      protocol: u.protocol,
+      hostname: ip,
+      port: u.port || (u.protocol === 'https:' ? 443 : 80),
+      path: u.pathname + u.search,
+      headers: { Host: u.hostname, 'User-Agent': 'guardrail/1.0' },
+      servername: u.protocol === 'https:' ? u.hostname : undefined,
+      timeout: 8000,
+    };
+    const req = mod.request(opts, (res) => {
+      let data = '';
+      res.on('data', (c) => (data += c));
+      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: data }));
+    });
+    req.on('error', reject);
+    req.on('timeout', () => req.destroy(new Error('timeout')));
+    req.end();
+  });
 }
 
 async function safeFetch(rawUrl, hops = 0) {
   if (hops > 5) throw new Error('too many redirects');
-  const check = await isUrlAllowed(rawUrl);
-  if (!check.ok) throw new Error(check.reason);
-  const res = await fetch(check.url.toString(), { redirect: 'manual' });
-  if (res.status >= 300 && res.status < 400) {
-    const loc = res.headers.get('location');
-    if (!loc) throw new Error('redirect without location');
-    return safeFetch(new URL(loc, check.url).toString(), hops + 1);
+  const structural = isUrlStructurallyAllowed(rawUrl);
+  if (!structural.ok) throw new Error(structural.reason);
+  const ip = await resolveHostSafe(structural.hostname);
+  const res = await requestPinned(structural.url, ip);
+  if (res.status >= 300 && res.status < 400 && res.headers.location) {
+    const nextUrl = new URL(res.headers.location, structural.url).toString();
+    return safeFetch(nextUrl, hops + 1); // fully re-validated: host allowlist + DNS + pinning
   }
-  const text = await res.text();
-  return text.slice(0, 5000);
+  return String(res.body).slice(0, 5000);
 }
 
 async function handle(req, res) {
