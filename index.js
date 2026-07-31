@@ -103,16 +103,18 @@ async function resolveHostSafe(hostname) {
   return (v4 || records[0]).address;
 }
 
-// combined check used before we actually connect (also used for the initial block/allow decision)
+// combined check used before we actually connect (also used for the initial block/allow decision).
+// Resolves DNS exactly once and returns the pinned IP so callers never re-resolve.
 async function isUrlAllowed(rawUrl) {
   const structural = isUrlStructurallyAllowed(rawUrl);
   if (!structural.ok) return structural;
+  let ip;
   try {
-    await resolveHostSafe(structural.hostname);
+    ip = await resolveHostSafe(structural.hostname);
   } catch (e) {
     return { ok: false, reason: e.message || 'dns validation failed' };
   }
-  return structural;
+  return { ok: true, url: structural.url, hostname: structural.hostname, ip };
 }
 
 // makes the actual HTTP(S) request to a pinned IP so the connection target
@@ -141,15 +143,18 @@ function requestPinned(u, ip) {
   });
 }
 
-async function safeFetch(rawUrl, hops = 0) {
+async function safeFetch(rawUrl, hops = 0, precheckedResult = null) {
   if (hops > 5) throw new Error('too many redirects');
-  const structural = isUrlStructurallyAllowed(rawUrl);
-  if (!structural.ok) throw new Error(structural.reason);
-  const ip = await resolveHostSafe(structural.hostname);
-  const res = await requestPinned(structural.url, ip);
+  // single source of truth: one DNS resolution, reused for both the
+  // allow/block decision and the actual outbound connection.
+  // On hop 0 we accept an already-computed check (from handle()) to
+  // avoid resolving DNS a second time for the same URL.
+  const check = precheckedResult || (await isUrlAllowed(rawUrl));
+  if (!check.ok) throw new Error(check.reason);
+  const res = await requestPinned(check.url, check.ip);
   if (res.status >= 300 && res.status < 400 && res.headers.location) {
-    const nextUrl = new URL(res.headers.location, structural.url).toString();
-    return safeFetch(nextUrl, hops + 1); // fully re-validated: host allowlist + DNS + pinning
+    const nextUrl = new URL(res.headers.location, check.url).toString();
+    return safeFetch(nextUrl, hops + 1); // fully re-validated: host allowlist + fresh single DNS + pinning
   }
   return String(res.body).slice(0, 5000);
 }
@@ -169,7 +174,7 @@ async function handle(req, res) {
       const check = await isUrlAllowed(rawUrl);
       if (!check.ok) return res.json({ action: 'block', reason: check.reason });
       try {
-        const content = await safeFetch(rawUrl);
+        const content = await safeFetch(rawUrl, 0, check);
         return res.json({ action: 'allow', reason: 'host allowlisted', result: content });
       } catch (e) {
         return res.json({ action: 'block', reason: e.message || 'fetch failed' });
